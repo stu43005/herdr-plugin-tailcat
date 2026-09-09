@@ -1,0 +1,31 @@
+id = "herdr.tailcat"
+name = "Tailcat Expose"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Expose the local herdr API socket through tailcat's WireGuard NAT-traversal tunnel"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[startup]]
+command = ["sh", "scripts/start.sh"]
+
+[[actions]]
+id = "token"
+title = "Show tailcat connection token"
+description = "Print the tunnel token and client-side connection instructions"
+contexts = ["global"]
+command = ["sh", "scripts/token.sh"]
+
+[[actions]]
+id = "stop"
+title = "Stop exposing the herdr socket"
+contexts = ["global"]
+command = ["sh", "scripts/stop.sh"]
+
+[[actions]]
+id = "restart"
+title = "Restart tailcat exposure"
+contexts = ["global"]
+command = ["sh", "scripts/restart.sh"]
