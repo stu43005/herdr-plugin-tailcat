@@ -7,7 +7,8 @@
 //
 //	HERDR_SOCKET_PATH        unix socket of the running herdr server
 //	HERDR_PLUGIN_STATE_DIR   key, token, pidfile, and log live here
-//	HERDR_PLUGIN_CONFIG_DIR  optional allow.list of client node keys
+//	HERDR_PLUGIN_CONFIG_DIR  optional allow.list of client node keys,
+//	                         optional pinned server.private.json
 package main
 
 import (
@@ -79,6 +80,10 @@ func main() {
 		Key:    priv,
 		Logf:   log.Printf,
 		Region: region,
+		// The pre-shared key is part of the saved identity (and of the
+		// token); a legacy key without one keeps the psk layer off.
+		PresharedKey:        pub.PresharedKey,
+		DisablePresharedKey: pub.PresharedKey.IsZero(),
 		ServedTCPPorts: []filter.PortRange{
 			{First: servePort, Last: servePort},
 		},
@@ -104,16 +109,28 @@ func main() {
 		log.Fatalf("start tailcat server: %v", err)
 	}
 
-	shortCI := tailcat.ConnInfo{ServerPublic: pub.ServerPublic, RegionID: region.RegionID}
-	fullCI := tailcat.ConnInfo{ServerPublic: pub.ServerPublic, Region: []*tailcfg.DERPRegion{region}}
-	short, full := shortCI.ConnBlob(), fullCI.ConnBlob()
-	writeFile(filepath.Join(stateDir, "token"), string(short))
-	writeFile(filepath.Join(stateDir, "token.full"), string(full))
+	// The token is the whole saved public identity (node key, disco key,
+	// preshared key) plus the DERP region, so it is a pure function of
+	// the key file and stable across restarts.
+	shortCI := tailcat.ConnInfo{
+		ServerPublic:      pub.ServerPublic,
+		ServerDiscoPublic: pub.ServerDiscoPublic,
+		PresharedKey:      pub.PresharedKey,
+		RegionID:          region.RegionID,
+	}
+	fullCI := tailcat.ConnInfo{
+		ServerPublic:      pub.ServerPublic,
+		ServerDiscoPublic: pub.ServerDiscoPublic,
+		PresharedKey:      pub.PresharedKey,
+		Region:            []*tailcfg.DERPRegion{region},
+	}
+	writeFile(filepath.Join(stateDir, "token"), string(shortCI.Addr()))
+	writeFile(filepath.Join(stateDir, "token.full"), string(fullCI.Addr()))
 	pidPath := filepath.Join(stateDir, "daemon.pid")
 	writeFile(pidPath, strconv.Itoa(os.Getpid()))
 
 	log.Printf("serving herdr socket %s on tunnel port %d", socketPath, servePort)
-	log.Printf("connection token: %s", short)
+	log.Printf("connection token: %s", shortCI.Addr())
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -125,12 +142,20 @@ func main() {
 // loadOrCreateKey returns the saved server key, generating one on first
 // run. The nearest DERP region is discovered once and baked into the
 // saved key, so the connection token stays stable across restarts
-// (mirrors `tailcat genkey --fixed-region`).
+// (mirrors `tailcat genkey --fixed-region`). Keys saved by older
+// tailcat versions are upgraded in place: the disco key (derived
+// deterministically from the node key) is backfilled, and a missing
+// region is resolved and re-saved.
 func loadOrCreateKey(path string) (key.NodePrivate, tailcat.ConnInfo, error) {
 	if j, err := os.ReadFile(path); err == nil {
 		var k tailcat.PrivateKey
 		if err := json.Unmarshal(j, &k); err != nil {
 			return key.NodePrivate{}, tailcat.ConnInfo{}, fmt.Errorf("parse %s: %w", path, err)
+		}
+		dirty := false
+		if k.Public.ServerDiscoPublic.IsZero() {
+			k.Public.ServerDiscoPublic = tailcat.DiscoPublicForNode(k.Private)
+			dirty = true
 		}
 		if len(k.Public.Region) == 0 {
 			// A key without a baked region (e.g. plain `tailcat genkey`
@@ -142,6 +167,9 @@ func loadOrCreateKey(path string) (key.NodePrivate, tailcat.ConnInfo, error) {
 			if err := k.Public.Expand(context.Background(), tailcat.ExpandForServer); err != nil {
 				return key.NodePrivate{}, tailcat.ConnInfo{}, fmt.Errorf("pick DERP region: %w", err)
 			}
+			dirty = true
+		}
+		if dirty {
 			if j, err := json.MarshalIndent(k, "", "  "); err == nil {
 				os.WriteFile(path, j, 0600)
 			}
@@ -154,7 +182,8 @@ func loadOrCreateKey(path string) (key.NodePrivate, tailcat.ConnInfo, error) {
 	k := tailcat.NewPrivateKey()
 	k.Public.RegionID = -1 // -1 = auto-detect nearest region
 	// Expand populates Public.Region (and zeroes RegionID) while
-	// keeping the ServerPublic that NewPrivateKey set.
+	// keeping the ServerPublic/ServerDiscoPublic/PresharedKey that
+	// NewPrivateKey set.
 	if err := k.Public.Expand(context.Background(), tailcat.ExpandForServer); err != nil {
 		return key.NodePrivate{}, tailcat.ConnInfo{}, fmt.Errorf("pick DERP region: %w", err)
 	}

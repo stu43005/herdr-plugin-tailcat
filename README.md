@@ -1,120 +1,137 @@
-# herdr.tailcat — 把本地 herdr socket 暴露到 tailcat 隧道
+# herdr.tailcat — expose your local herdr socket over a tailcat tunnel
 
-一个 [herdr](https://herdr.dev) 插件：把本机的 herdr API socket（默认
-`~/.config/herdr/herdr.sock`）通过 [tailcat](https://github.com/tailscale/tailcat)
-的内网穿透隧道暴露出去 —— WireGuard 端到端加密、DERP 中继打洞、无控制面、无需 root、
-不在本机开任何监听端口。
+A [herdr](https://herdr.dev) plugin that exposes the local herdr API socket
+(`~/.config/herdr/herdr.sock`) through a [tailcat](https://github.com/tailscale/tailcat)
+tunnel — WireGuard end-to-end encryption, DERP-relay NAT traversal, no control
+plane, no root, and **no listening ports on your machine**.
 
-适合的场景：在另一台机器上用 herdr 客户端（如 [herdrm](https://github.com/missuo/herdrm)、
-`herdr api`、脚本）驱动这台机器上的 herdr，而不需要 SSH 端口转发。
+Use case: drive this machine's herdr from another device — with
+[herdrm](https://github.com/missuo/herdrm), `herdr api`, or your own scripts —
+without SSH port forwarding.
 
-## 工作原理
+## How it works
 
 ```
-┌─ 远端客户端 ─┐   WireGuard/DERP   ┌─ herdr-tailcatd（本插件）─┐
-│ tailcat CLI  │ ══════════════════▶ │ tailcat.Server            │
-│ 或 socat 桥接 │ ◂═════════════════ │   OnTCP :6464 ──dial──▶ herdr.sock │
-└──────────────┘   加密 + NAT 穿透   └────────────────────────────┘
+┌─ remote client ─┐  WireGuard/DERP  ┌─ herdr-tailcatd (this plugin) ─┐
+│ tailcat CLI     │ ═══════════════▶ │ tailcat.Server                 │
+│ or socat bridge │ ◂═══════════════ │   OnTCP :6464 ──dial──▶ herdr.sock │
+└─────────────────┘  encrypted, NAT  └────────────────────────────────┘
+                     traversal
 ```
 
-- 守护进程 `herdr-tailcatd`（Go，基于 tailcat 库）在隧道内只监听一个虚拟端口 **6464**，
-  并把每条连接原样转发到本地 herdr Unix socket（herdr 协议是换行分隔的 JSON-RPC，
-  按字节透传即可）。
-- tailcat 的包过滤被收紧到仅 6464 端口，隧道到不了本机任何其他端口。
-- 首次启动生成服务器密钥并把最近的 DERP 区域固化进去
-  （等价于 `tailcat genkey --fixed-region`），所以 **token 在重启后保持稳定**。
+- The `herdr-tailcatd` daemon (Go, built on the tailcat library) serves a
+  single virtual port, **6464**, inside the tunnel and byte-forwards every
+  connection to the local herdr unix socket (the herdr protocol is
+  newline-delimited JSON-RPC, so plain byte proxying is all it takes).
+- tailcat's packet filter is tightened to port 6464 only — the tunnel cannot
+  reach anything else on the machine.
+- The token carries a WireGuard pre-shared key (post-quantum confidentiality,
+  and a DERP relay operator can't join the tunnel even if it observes the
+  handshake).
 
-### Key 与 token 的稳定性
-
-token 由服务器私钥派生：key 不变，token 就不变。守护进程保证这一点的机制：
-
-- key 只生成一次，存放在插件 state 目录的 `server.private.json`（0600），
-  之后每次启动（herdr 重启、live handoff、守护进程崩溃后被重新拉起）都加载同一个文件。
-- DERP 区域在首次运行时探测一次并固化进 key 文件，重启不再重新探测
-  （否则换区域 = 换 token）。
-- **想彻底钉死身份**（跨插件重装、state 目录被清也能保住 token）：
-  把 `server.private.json` 复制到插件 config 目录
-  （`herdr plugin config-dir herdr.tailcat`）。config 目录里的 key 优先于
-  state 目录，且永远不会被覆盖。也可以直接放一个 `tailcat genkey`
-  生成的 key 文件进去（缺 Region 的会自动补全并回写）。
-- 想让 token 失效换新身份：删掉两处 key 文件后 restart。
-- 短 token 引用的是 tailcat 公共 DERP map 里的区域 ID；万一上游 map 变动导致
-  短 token 无法解析，用 `token.full`（内嵌中继信息，不受影响），或删 key 重新生成。
-
-## 安装
+## Install
 
 ```sh
-# 本地开发
-herdr plugin link /path/to/herdr_tc        # 本仓库
-sh scripts/build.sh                        # link 不会自动跑 build
+# local development
+herdr plugin link /path/to/herdr_tc
+sh scripts/build.sh                 # `link` does not run build commands
 
-# 或从 GitHub 安装（发布时把 go.mod 里的 replace 换成正式版本号）
+# or from GitHub once published
 herdr plugin install <owner>/<repo>
 ```
 
-启用后，herdr 每次启动（以及 live handoff 后）都会通过 `[[startup]]` 钩子
-自动拉起守护进程；已有实例在跑时是幂等的。
+Once enabled, herdr runs the `[[startup]]` hook on every server start (and
+after a live handoff), which launches the daemon; it is idempotent when an
+instance is already running.
 
-## 使用
+## Usage
 
 ```sh
-herdr plugin action invoke herdr.tailcat.token     # 查看 token 和客户端用法
-herdr plugin action invoke herdr.tailcat.restart   # 重启暴露
-herdr plugin action invoke herdr.tailcat.stop      # 停止暴露（token 立即失效）
-herdr plugin log list --plugin herdr.tailcat       # 查看钩子执行日志
+herdr plugin action invoke herdr.tailcat.token     # show token + client instructions
+herdr plugin action invoke herdr.tailcat.restart   # restart the exposure
+herdr plugin action invoke herdr.tailcat.stop      # stop; the token dies immediately
+herdr plugin log list --plugin herdr.tailcat       # hook execution logs
 ```
 
-### 客户端
+### Client side
 
-一次性会话（stdin/stdout 就是 herdr socket 的字节流）：
+One-off session (stdin/stdout is the herdr socket byte stream):
 
 ```sh
 printf '{"id":"1","method":"plugin.list","params":{}}\n' | tailcat <token> 6464
 ```
 
-给 herdrm 这类期望 Unix socket 的客户端用的常驻桥接：
+Persistent local bridge for clients that expect a unix socket (e.g. herdrm):
 
 ```sh
 socat UNIX-LISTEN:/tmp/herdr-remote.sock,fork EXEC:'tailcat <token> 6464'
-# 然后让客户端连 /tmp/herdr-remote.sock
+# then point the client at /tmp/herdr-remote.sock
 ```
 
-## 安全（务必阅读）
+Clients need tailcat v0.6.0 or newer (the address format gained a disco key
+and pre-shared key in v0.6.0).
 
-herdr 的插件模型**没有沙箱**；同样，这个插件暴露的 herdr socket 拥有对 herdr
-服务器的**完全控制权**（往任意 pane 发按键、启动 agent、调用全部 API）。
-请把它当作"把 shell 暴露到网络上"来对待：
+## Key & token stability
 
-- **token 即凭据**。任何拿到 token 的人都能连接。token 文件以 0600 存放在
-  插件 state 目录；不要在公开场合粘贴。
-- **建议配置客户端白名单**。在 `herdr plugin config-dir herdr.tailcat`
-  指向的目录里创建 `allow.list`，每行一个客户端 nodekey（客户端用
-  `tailcat genkey --client` 生成），然后 restart。未匹配的客户端在
-  WireGuard 握手阶段就会被静默忽略，甚至无法得知服务存在。
-- 不需要时及时 `stop`；卸载插件（`herdr plugin unlink herdr.tailcat`）
-  后记得确认守护进程已停止。
-- 传输本身始终是 WireGuard 端到端加密；DERP 中继只看得到密文。
+The token is derived from the server identity: same key, same token. The
+daemon guarantees this:
 
-## 文件说明
+- The key is generated exactly once, stored as `server.private.json` (mode
+  0600) in the plugin state dir, and loaded on every subsequent start —
+  herdr restarts, live handoffs, and daemon crashes all keep the token.
+- The DERP region is probed once at first run and baked into the key file;
+  restarts never re-probe (re-probing could change the region, which would
+  change the token).
+- **To pin the identity permanently** (surviving even a plugin reinstall or
+  a wiped state dir): copy `server.private.json` into the plugin config dir
+  (`herdr plugin config-dir herdr.tailcat`). A key in the config dir takes
+  precedence over the state dir and is never overwritten. A key file from
+  `tailcat genkey` works too (a missing region is resolved and written back).
+- To rotate: delete the key file(s) in both dirs and restart — a fresh
+  identity and token are generated.
+- The short token references a region ID in tailcat's public DERP map; if an
+  upstream map change ever breaks it, use `token.full` (embeds the relay
+  info, immune to map changes) or regenerate the key.
+
+## Security (read this)
+
+herdr's plugin model has **no sandbox**, and the socket this plugin exposes
+grants **full control** of the herdr server (send keystrokes to any pane,
+start agents, call every API). Treat this like putting a shell on the
+network:
+
+- **The token is a credential.** Anyone holding it can connect. Token files
+  are stored mode 0600 in the plugin state dir; never paste them in public.
+- **Use the client allow-list.** Create `allow.list` in the plugin config
+  dir (`herdr plugin config-dir herdr.tailcat`) with one client `nodekey:...`
+  per line (clients generate one with `tailcat genkey --client`), then
+  restart. Non-matching clients are silently dropped at the WireGuard
+  handshake — they can't even learn the service exists.
+- `stop` the exposure when you don't need it; after
+  `herdr plugin unlink herdr.tailcat`, make sure the daemon is stopped.
+- Transport is always WireGuard end-to-end encrypted with a pre-shared key;
+  DERP relays only ever see ciphertext.
+
+## Files
 
 ```
-herdr-plugin.toml          插件清单（startup 钩子 + token/stop/restart 三个 action）
-cmd/herdr-tailcatd/        守护进程（Go + tailcat 库）
+herdr-plugin.toml          manifest (startup hook + token/stop/restart actions)
+cmd/herdr-tailcatd/        the daemon (Go + tailcat library v0.6.0)
 scripts/build.sh           go build → bin/herdr-tailcatd
-scripts/start.sh           幂等启动（startup 钩子）
-scripts/stop.sh            停止
-scripts/restart.sh         重启
-scripts/token.sh           打印 token 与客户端用法
+scripts/start.sh           idempotent start (startup hook)
+scripts/stop.sh            stop
+scripts/restart.sh         restart
+scripts/token.sh           print token and client instructions
 ```
 
-## 开发
-
-本仓库的 `go.mod` 用 `replace github.com/tailscale/tailcat => ../tailcat`
-指向旁边的 tailcat 源码树。发布前请去掉 replace 并 require 一个正式版本。
+## Development
 
 ```sh
-sh scripts/build.sh                                  # 构建
+sh scripts/build.sh                                  # build
 HERDR_SOCKET_PATH=~/.config/herdr/herdr.sock \
 HERDR_PLUGIN_STATE_DIR=.state \
-  ./bin/herdr-tailcatd                               # 前台手动跑（调试用）
+  ./bin/herdr-tailcatd                               # run in foreground for debugging
 ```
+
+Requires Go ≥ 1.27.1 (inherited from tailcat v0.6.0); older Go toolchains
+with toolchain auto-download enabled work too.
