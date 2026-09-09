@@ -33,6 +33,6 @@ if [ -f "$CONFIG/allow.list" ]; then
 	echo "client allow-list: active ($(grep -cv '^\s*\(#\|$\)' "$CONFIG/allow.list" || echo 0) key(s))"
 else
 	echo "client allow-list: OFF — anyone holding the token can connect."
-	echo "  create $(herdr plugin config-dir herdr.tailcat 2>/dev/null || echo '<plugin config dir>')/allow.list"
-	echo "  with client nodekey:... lines to restrict access, then restart."
+	echo "  create $CONFIG/allow.list with client nodekey:... lines"
+	echo "  to restrict access, then restart."
 fi

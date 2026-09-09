@@ -31,10 +31,13 @@ import (
 	"tailscale.com/wgengine/filter"
 )
 
-// servePort is the TCP port inside the tunnel on which the herdr socket
-// is served. The packet filter is tightened to just this port, so the
-// tunnel cannot reach anything else on this machine.
+// servePort is the TCP port inside the tunnel on which the herdr API socket
+// is served. clientPort serves the herdr client-protocol socket, which
+// terminal attach (`herdr agent attach`) connects to. The packet filter is
+// tightened to just these two ports, so the tunnel cannot reach anything else
+// on this machine.
 const servePort = 6464
+const clientPort = 6465
 
 func main() {
 	log.SetPrefix("[herdr-tailcatd] ")
@@ -55,6 +58,14 @@ func main() {
 
 	if st, err := os.Stat(socketPath); err != nil || st.Mode()&os.ModeSocket == 0 {
 		log.Fatalf("herdr socket %s not found; is the herdr server running?", socketPath)
+	}
+
+	// Terminal attach speaks herdr's client protocol on a second socket derived
+	// from the API socket path (herdr.sock -> herdr-client.sock). Serve it too;
+	// without it attach has nothing to connect to.
+	clientSocketPath := deriveClientSocket(socketPath)
+	if st, err := os.Stat(clientSocketPath); err != nil || st.Mode()&os.ModeSocket == 0 {
+		log.Printf("warning: client socket %s not found; terminal attach will fail (control RPC still works)", clientSocketPath)
 	}
 
 	// The identity key is looked up in the config dir first: a key the
@@ -86,19 +97,26 @@ func main() {
 		DisablePresharedKey: pub.PresharedKey.IsZero(),
 		ServedTCPPorts: []filter.PortRange{
 			{First: servePort, Last: servePort},
+			{First: clientPort, Last: clientPort},
 		},
 		OnTCP: func(port uint16) func(net.Conn) {
-			if port != servePort {
+			var target string
+			switch port {
+			case servePort:
+				target = socketPath
+			case clientPort:
+				target = clientSocketPath
+			default:
 				return nil
 			}
 			return func(c net.Conn) {
 				defer c.Close()
-				local, err := net.Dial("unix", socketPath)
+				local, err := net.Dial("unix", target)
 				if err != nil {
-					log.Printf("dial %s: %v", socketPath, err)
+					log.Printf("dial %s: %v", target, err)
 					return
 				}
-				log.Printf("client connected, proxying to %s", socketPath)
+				log.Printf("client connected on port %d, proxying to %s", port, target)
 				tailcat.ProxyConns(c, local)
 			}
 		},
@@ -130,6 +148,7 @@ func main() {
 	writeFile(pidPath, strconv.Itoa(os.Getpid()))
 
 	log.Printf("serving herdr socket %s on tunnel port %d", socketPath, servePort)
+	log.Printf("serving herdr client socket %s on tunnel port %d", clientSocketPath, clientPort)
 	log.Printf("connection token: %s", shortCI.Addr())
 
 	sig := make(chan os.Signal, 1)
@@ -137,6 +156,15 @@ func main() {
 	<-sig
 	s.Close()
 	os.Remove(pidPath)
+}
+
+// deriveClientSocket mirrors herdr's derive_client_socket_from_api_socket:
+// insert "-client" before the ".sock" extension (herdr.sock -> herdr-client.sock).
+func deriveClientSocket(apiSocket string) string {
+	dir := filepath.Dir(apiSocket)
+	base := filepath.Base(apiSocket)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	return filepath.Join(dir, stem+"-client.sock")
 }
 
 // loadOrCreateKey returns the saved server key, generating one on first
