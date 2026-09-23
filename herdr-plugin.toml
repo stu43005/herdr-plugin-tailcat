@@ -3,29 +3,31 @@ name = "Tailcat Expose"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Expose the local herdr API socket through tailcat's WireGuard NAT-traversal tunnel"
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
+# Commands run without a shell, so everything goes through the daemon
+# binary itself; `go build -o bin/` adds .exe on Windows.
 [[build]]
-command = ["sh", "scripts/build.sh"]
+command = ["go", "build", "-o", "bin/", "./cmd/herdr-tailcatd"]
 
 [[startup]]
-command = ["sh", "scripts/start.sh"]
+command = ["bin/herdr-tailcatd", "start"]
 
 [[actions]]
 id = "token"
 title = "Show tailcat connection token"
 description = "Print the tunnel token and client-side connection instructions"
 contexts = ["global"]
-command = ["sh", "scripts/token.sh"]
+command = ["bin/herdr-tailcatd", "token"]
 
 [[actions]]
 id = "stop"
 title = "Stop exposing the herdr socket"
 contexts = ["global"]
-command = ["sh", "scripts/stop.sh"]
+command = ["bin/herdr-tailcatd", "stop"]
 
 [[actions]]
 id = "restart"
 title = "Restart tailcat exposure"
 contexts = ["global"]
-command = ["sh", "scripts/restart.sh"]
+command = ["bin/herdr-tailcatd", "restart"]

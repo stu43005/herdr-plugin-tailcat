@@ -1,9 +1,11 @@
 # herdr.tailcat — expose your local herdr socket over a tailcat tunnel
 
 A [herdr](https://herdr.dev) plugin that exposes the local herdr API socket
-(`~/.config/herdr/herdr.sock`) through a [tailcat](https://github.com/tailscale/tailcat)
+(`~/.config/herdr/herdr.sock`; on Windows the named pipe behind
+`%APPDATA%\herdr\herdr.sock`) through a [tailcat](https://github.com/tailscale/tailcat)
 tunnel — WireGuard end-to-end encryption, DERP-relay NAT traversal, no control
-plane, no root, and **no listening ports on your machine**.
+plane, no root, and **no listening ports on your machine**. Runs on Linux,
+macOS, and Windows.
 
 Use case: drive this machine's herdr from another device — with
 [herdrm](https://github.com/missuo/herdrm), `herdr api`, or your own scripts —
@@ -19,12 +21,19 @@ without SSH port forwarding.
                      traversal
 ```
 
-- The `herdr-tailcatd` daemon (Go, built on the tailcat library) serves a
-  single virtual port, **6464**, inside the tunnel and byte-forwards every
-  connection to the local herdr unix socket (the herdr protocol is
-  newline-delimited JSON-RPC, so plain byte proxying is all it takes).
-- tailcat's packet filter is tightened to port 6464 only — the tunnel cannot
-  reach anything else on the machine.
+- The `herdr-tailcatd` daemon (Go, built on the tailcat library) serves
+  virtual port **6464** inside the tunnel and byte-forwards every connection
+  to the local herdr API socket (the herdr protocol is newline-delimited
+  JSON-RPC, so plain byte proxying is all it takes). Port **6465** forwards
+  to herdr's client-protocol socket (`herdr-client.sock`) for terminal
+  attach.
+- On Windows herdr serves each "socket" as a named pipe called
+  `\\.\pipe\<full socket path>` (the `.sock` file only holds a `pid:timestamp`
+  marker); the daemon dials that pipe instead of a unix socket. Named pipes
+  have no half-close, so when a tunnel client finishes sending, the daemon
+  keeps relaying herdr's output until the pipe has been idle for 5 seconds.
+- tailcat's packet filter is tightened to ports 6464 and 6465 only — the
+  tunnel cannot reach anything else on the machine.
 - The token carries a WireGuard pre-shared key (post-quantum confidentiality,
   and a DERP relay operator can't join the tunnel even if it observes the
   handshake).
@@ -34,15 +43,23 @@ without SSH port forwarding.
 ```sh
 # local development
 herdr plugin link /path/to/herdr_tc
-sh scripts/build.sh                 # `link` does not run build commands
+go build -o bin/ ./cmd/herdr-tailcatd   # `link` does not run build commands
+                                        # (or: sh scripts/build.sh)
 
 # or from GitHub once published
 herdr plugin install <owner>/<repo>
 ```
 
+Installing needs Go on `PATH` (the `[[build]]` step compiles the daemon).
+
 Once enabled, herdr runs the `[[startup]]` hook on every server start (and
 after a live handoff), which launches the daemon; it is idempotent when an
 instance is already running.
+
+Every manifest command runs the daemon binary directly
+(`bin/herdr-tailcatd <start|stop|restart|token>`), so no shell is needed and
+the same manifest works on all three platforms. The binary must be built
+before the hook or any action runs.
 
 ## Usage
 
@@ -109,29 +126,34 @@ network:
   handshake — they can't even learn the service exists.
 - `stop` the exposure when you don't need it; after
   `herdr plugin unlink herdr.tailcat`, make sure the daemon is stopped.
+  On Windows `stop` terminates the process outright, since there is no
+  SIGTERM to deliver to a detached process.
 - Transport is always WireGuard end-to-end encrypted with a pre-shared key;
   DERP relays only ever see ciphertext.
 
 ## Files
 
 ```
-herdr-plugin.toml          manifest (startup hook + token/stop/restart actions)
-cmd/herdr-tailcatd/        the daemon (Go + tailcat library v0.6.0)
-scripts/build.sh           go build → bin/herdr-tailcatd
-scripts/start.sh           idempotent start (startup hook)
-scripts/stop.sh            stop
-scripts/restart.sh         restart
-scripts/token.sh           print token and client instructions
+herdr-plugin.toml                    manifest (build, startup hook, token/stop/restart actions)
+cmd/herdr-tailcatd/main.go           tunnel daemon (`serve`) and subcommand dispatch
+cmd/herdr-tailcatd/control.go        start (detached, idempotent) / stop / token
+cmd/herdr-tailcatd/platform_*.go     unix socket vs. Windows named pipe, process control
+scripts/build.sh                     go build → bin/herdr-tailcatd[.exe]
 ```
 
 ## Development
 
 ```sh
-sh scripts/build.sh                                  # build
-HERDR_SOCKET_PATH=~/.config/herdr/herdr.sock \
-HERDR_PLUGIN_STATE_DIR=.state \
-  ./bin/herdr-tailcatd                               # run in foreground for debugging
+go build -o bin/ ./cmd/herdr-tailcatd                # build
+./bin/herdr-tailcatd                                 # run in foreground for debugging
+./bin/herdr-tailcatd start|stop|restart|token        # what the manifest runs
 ```
+
+Without herdr's environment the daemon defaults to `.state/` and `.config/`
+in the plugin checkout, and to herdr's default socket
+(`~/.config/herdr/herdr.sock`, or `%APPDATA%\herdr\herdr.sock` on Windows);
+set `HERDR_SOCKET_PATH`, `HERDR_PLUGIN_STATE_DIR`, or
+`HERDR_PLUGIN_CONFIG_DIR` to override.
 
 Requires Go ≥ 1.27.1 (inherited from tailcat v0.6.0); older Go toolchains
 with toolchain auto-download enabled work too.

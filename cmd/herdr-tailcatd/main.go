@@ -1,11 +1,20 @@
 // Command herdr-tailcatd exposes the local herdr API socket through a
 // tailcat tunnel: WireGuard-encrypted, NAT-traversing, with no control
-// plane. It is launched by the herdr.tailcat plugin (see
-// scripts/start.sh) and runs as a detached background process.
+// plane. The herdr.tailcat plugin runs it directly from its manifest, on
+// every platform:
+//
+//	herdr-tailcatd [serve]   run the tunnel in the foreground
+//	herdr-tailcatd start     launch `serve` as a detached background process
+//	                         unless one is already running (startup hook)
+//	herdr-tailcatd stop      stop the background process
+//	herdr-tailcatd restart   stop, then start
+//	herdr-tailcatd token     print the token and client instructions
 //
 // Environment (all injected by herdr when run as a plugin):
 //
-//	HERDR_SOCKET_PATH        unix socket of the running herdr server
+//	HERDR_SOCKET_PATH        herdr API socket (a unix socket, or on Windows
+//	                         the marker file of a named pipe)
+//	HERDR_PLUGIN_ROOT        plugin checkout; default: parent of bin/
 //	HERDR_PLUGIN_STATE_DIR   key, token, pidfile, and log live here
 //	HERDR_PLUGIN_CONFIG_DIR  optional allow.list of client node keys,
 //	                         optional pinned server.private.json
@@ -43,20 +52,79 @@ func main() {
 	log.SetPrefix("[herdr-tailcatd] ")
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 
-	socketPath := os.Getenv("HERDR_SOCKET_PATH")
-	if socketPath == "" {
-		socketPath = filepath.Join(os.Getenv("HOME"), ".config", "herdr", "herdr.sock")
+	cmd := "serve"
+	if len(os.Args) > 1 {
+		cmd = os.Args[1]
 	}
-	stateDir := os.Getenv("HERDR_PLUGIN_STATE_DIR")
-	if stateDir == "" {
-		stateDir = ".state" // manual runs from the plugin root
+	p := loadPaths()
+	var err error
+	switch cmd {
+	case "serve":
+		serve(p)
+	case "start":
+		err = start(p)
+	case "stop":
+		err = stop(p)
+	case "restart":
+		if err = stop(p); err == nil {
+			err = start(p)
+		}
+	case "token":
+		err = token(p)
+	default:
+		fmt.Fprintf(os.Stderr, "usage: herdr-tailcatd [serve|start|stop|restart|token]\n")
+		os.Exit(2)
 	}
-	configDir := os.Getenv("HERDR_PLUGIN_CONFIG_DIR")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herdr-tailcatd %s: %v\n", cmd, err)
+		os.Exit(1)
+	}
+}
+
+// paths are the locations shared by the daemon and its control commands.
+type paths struct {
+	socket  string // herdr API socket
+	state   string // key, token, pidfile, log
+	config  string // optional allow.list, pinned key
+	pidFile string
+}
+
+// loadPaths resolves paths from the herdr-injected environment, falling
+// back to the plugin checkout so manual runs work from a plain shell too.
+func loadPaths() paths {
+	root := os.Getenv("HERDR_PLUGIN_ROOT")
+	if root == "" {
+		// The binary lives in <root>/bin.
+		if exe, err := os.Executable(); err == nil {
+			root = filepath.Dir(filepath.Dir(exe))
+		}
+	}
+	p := paths{
+		socket: os.Getenv("HERDR_SOCKET_PATH"),
+		state:  os.Getenv("HERDR_PLUGIN_STATE_DIR"),
+		config: os.Getenv("HERDR_PLUGIN_CONFIG_DIR"),
+	}
+	if p.socket == "" {
+		p.socket = defaultSocketPath()
+	}
+	if p.state == "" {
+		p.state = filepath.Join(root, ".state")
+	}
+	if p.config == "" {
+		p.config = filepath.Join(root, ".config")
+	}
+	p.pidFile = filepath.Join(p.state, "daemon.pid")
+	return p
+}
+
+// serve runs the tunnel in the foreground until interrupted or terminated.
+func serve(p paths) {
+	socketPath, stateDir, configDir := p.socket, p.state, p.config
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		log.Fatalf("state dir: %v", err)
 	}
 
-	if st, err := os.Stat(socketPath); err != nil || st.Mode()&os.ModeSocket == 0 {
+	if !localSocketExists(socketPath) {
 		log.Fatalf("herdr socket %s not found; is the herdr server running?", socketPath)
 	}
 
@@ -64,7 +132,7 @@ func main() {
 	// from the API socket path (herdr.sock -> herdr-client.sock). Serve it too;
 	// without it attach has nothing to connect to.
 	clientSocketPath := deriveClientSocket(socketPath)
-	if st, err := os.Stat(clientSocketPath); err != nil || st.Mode()&os.ModeSocket == 0 {
+	if !localSocketExists(clientSocketPath) {
 		log.Printf("warning: client socket %s not found; terminal attach will fail (control RPC still works)", clientSocketPath)
 	}
 
@@ -111,7 +179,7 @@ func main() {
 			}
 			return func(c net.Conn) {
 				defer c.Close()
-				local, err := net.Dial("unix", target)
+				local, err := dialLocal(target)
 				if err != nil {
 					log.Printf("dial %s: %v", target, err)
 					return
@@ -144,7 +212,7 @@ func main() {
 	}
 	writeFile(filepath.Join(stateDir, "token"), string(shortCI.Addr()))
 	writeFile(filepath.Join(stateDir, "token.full"), string(fullCI.Addr()))
-	pidPath := filepath.Join(stateDir, "daemon.pid")
+	pidPath := p.pidFile
 	writeFile(pidPath, strconv.Itoa(os.Getpid()))
 
 	log.Printf("serving herdr socket %s on tunnel port %d", socketPath, servePort)
@@ -152,7 +220,9 @@ func main() {
 	log.Printf("connection token: %s", shortCI.Addr())
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	// On Windows `stop` terminates the process outright, so this only
+	// covers Ctrl+C there; `stop` removes the pidfile itself.
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	s.Close()
 	os.Remove(pidPath)
