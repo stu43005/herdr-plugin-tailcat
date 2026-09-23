@@ -104,6 +104,9 @@ daemon guarantees this:
   (`herdr plugin config-dir herdr.tailcat`). A key in the config dir takes
   precedence over the state dir and is never overwritten. A key file from
   `tailcat genkey` works too (a missing region is resolved and written back).
+  So does one made with `tailcat genkey --region=<derp-host>` for your own
+  DERP relay; since such a relay has no ID in the public DERP map, both
+  `token` and `token.full` then embed the relay info.
 - To rotate: delete the key file(s) in both dirs and restart — a fresh
   identity and token are generated.
 - The short token references a region ID in tailcat's public DERP map; if an

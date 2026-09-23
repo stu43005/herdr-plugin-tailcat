@@ -152,8 +152,22 @@ func serve(p paths) {
 	if pub.ServerPublic.NodePublic.IsZero() || pub.ServerPublic.NodePublic != priv.Public() {
 		log.Fatalf("server key file %s is corrupt (public key mismatch); delete it to regenerate", keyPath)
 	}
+	// A key made with custom DERP hostnames (`tailcat genkey
+	// --region=<host>`) has a region with no DERP map ID. Like the tailcat
+	// CLI, let Expand number it (a no-op for regions that have an ID, and
+	// no network access either way), and embed the relay info in the
+	// short token too: an ID alone would point clients at whatever region
+	// the public DERP map has under that number.
+	customRegion := pub.Region[0].RegionID == 0
+	if err := pub.Expand(context.Background(), tailcat.ExpandForServer); err != nil {
+		log.Fatalf("server key %s: %v", keyPath, err)
+	}
 	region := pub.Region[0]
-	log.Printf("key %s: bootstrap relay region %d (%s)", keyPath, region.RegionID, region.RegionName)
+	regionName := region.RegionName
+	if customRegion && len(region.Nodes) > 0 {
+		regionName = region.Nodes[0].HostName
+	}
+	log.Printf("key %s: bootstrap relay region %d (%s)", keyPath, region.RegionID, regionName)
 
 	s := &tailcat.Server{
 		Key:    priv,
@@ -209,6 +223,9 @@ func serve(p paths) {
 		ServerDiscoPublic: pub.ServerDiscoPublic,
 		PresharedKey:      pub.PresharedKey,
 		Region:            []*tailcfg.DERPRegion{region},
+	}
+	if customRegion {
+		shortCI = fullCI
 	}
 	writeFile(filepath.Join(stateDir, "token"), string(shortCI.Addr()))
 	writeFile(filepath.Join(stateDir, "token.full"), string(fullCI.Addr()))
