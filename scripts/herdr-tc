@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Attach the local herdr TUI to a remote herdr server exposed by
+# herdr-plugin-tailcat (tunnel port 6464 = API socket, 6465 = client socket).
+#
+# Usage: herdr-tc <tc-addr> [herdr subcommand ...]
+#   herdr-tc tcXXXX                  # attach the TUI, reconnecting on drops
+#   herdr-tc tcXXXX workspace list   # run one CLI command against the remote
+#
+# Environment:
+#   HERDR_TC_KEY          tailcat client key name or path (default: tailcat's
+#                         own default, i.e. the saved "client-default" key)
+#   HERDR_TC_MAX_RETRIES  reconnect attempts in a row before giving up
+#                         (default: 0 = retry forever)
+#   HERDR_TC_LOG_DIR      where per-run logs are kept
+#                         (default: ~/Library/Logs/herdr-tc on macOS,
+#                         $XDG_STATE_HOME/herdr-tc elsewhere)
+#
+# When the TUI loses its connection, the whole tunnel (tailcat forward and
+# socat bridges) is rebuilt and herdr reattaches. Detaching or quitting
+# herdr ends the script and tears everything down.
+
+set -euo pipefail
+
+usage() {
+	echo "usage: $(basename "$0") <tc-addr> [herdr subcommand ...]" >&2
+	exit 2
+}
+
+[[ $# -ge 1 && -n $1 ]] || usage
+addr=$1
+shift
+key_args=()
+[[ -n ${HERDR_TC_KEY:-} ]] && key_args=(--key="$HERDR_TC_KEY")
+max_retries=${HERDR_TC_MAX_RETRIES:-0}
+
+for bin in tailcat socat herdr; do
+	command -v "$bin" >/dev/null || {
+		echo "error: $bin not found in PATH" >&2
+		exit 1
+	}
+done
+
+workdir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-tc.XXXXXX")
+chmod 700 "$workdir"
+if [[ $(uname -s) == Darwin ]]; then
+	default_log_dir=$HOME/Library/Logs/herdr-tc
+else
+	default_log_dir=${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tc
+fi
+log_dir=${HERDR_TC_LOG_DIR:-$default_log_dir}
+mkdir -p "$log_dir"
+# Kept after exit so connection drops can be diagnosed afterwards.
+log="$log_dir/$(date +%Y%m%d-%H%M%S)-$$.log"
+api_sock="$workdir/herdr.sock"
+client_sock="$workdir/herdr-client.sock"
+errfile="$workdir/herdr.err"
+pids=()
+status=0
+
+note() {
+	echo "$(date '+%Y/%m/%d %H:%M:%S') herdr-tc: $*" >>"$log"
+}
+
+stop_tunnel() {
+	if ((${#pids[@]})); then
+		kill "${pids[@]}" 2>/dev/null || true
+		# tailcat forward's SIGTERM handler waits, with no timeout, for every
+		# tunnel connection to be closed by the remote end (forward.go), so
+		# a dead tunnel or a peer that never closes would block wait forever.
+		local _ pid alive
+		for _ in $(seq 1 30); do
+			alive=0
+			for pid in "${pids[@]}"; do
+				kill -0 "$pid" 2>/dev/null && alive=1
+			done
+			((alive)) || break
+			sleep 0.1
+		done
+		kill -KILL "${pids[@]}" 2>/dev/null || true
+		wait "${pids[@]}" 2>/dev/null || true
+	fi
+	pids=()
+	rm -f "$api_sock" "$client_sock"
+}
+
+# shellcheck disable=SC2329 # invoked via trap
+cleanup() {
+	# Ignore (rather than reset) signals while tearing down: a second Ctrl-C
+	# here would otherwise kill this shell and orphan tailcat forward, since
+	# background jobs of a non-interactive shell ignore SIGINT themselves.
+	trap '' INT TERM HUP
+	trap - EXIT
+	stop_tunnel
+	if ((status != 0)); then
+		echo "--- tailcat log ($log) ---" >&2
+		tail -n 20 "$log" >&2
+	fi
+	rm -rf "$workdir"
+}
+trap cleanup EXIT
+trap 'status=130; exit 130' INT
+trap 'status=143; exit 143' TERM HUP
+
+fail() {
+	echo "error: $*" >&2
+	status=1
+	exit 1
+}
+
+local_port() {
+	sed -n "s/.*forwarding 127\.0\.0\.1:\([0-9]*\) -> remote localhost:$1\$/\1/p" | tail -n 1
+}
+
+# start_tunnel brings up tailcat forward plus the two socat bridges. It must
+# run in the main shell (not $(...)) so pids reaches stop_tunnel. On failure
+# it sets reason and returns non-zero, leaving nothing running.
+reason=''
+start_tunnel() {
+	# Ping first: a bad token, unknown key, or allow.list rejection fails
+	# here with a clear error instead of a herdr connection hang later.
+	if ! tailcat ${key_args[@]+"${key_args[@]}"} ping --timeout=15s "$addr" >>"$log" 2>&1; then
+		reason="tailcat ping failed (bad tc-addr, missing client key, not in allow.list, or remote unreachable)"
+		return 1
+	fi
+
+	# A single long-lived tailcat process carries both ports: one client key
+	# must not be used by two tailcat processes at once. Port 0 lets the OS
+	# pick free local ports; tailcat logs which ones it chose. Only log lines
+	# after mark are scanned, so earlier runs' listeners are ignored.
+	note "starting tailcat forward"
+	local mark
+	mark=$(wc -l <"$log")
+	tailcat ${key_args[@]+"${key_args[@]}"} forward "$addr" 0:6464 0:6465 >>"$log" 2>&1 </dev/null &
+	pids+=($!)
+
+	local api_port='' client_port='' _
+	for _ in $(seq 1 100); do
+		api_port=$(tail -n +"$((mark + 1))" "$log" | local_port 6464)
+		client_port=$(tail -n +"$((mark + 1))" "$log" | local_port 6465)
+		[[ -n $api_port && -n $client_port ]] && break
+		if ! kill -0 "${pids[0]}" 2>/dev/null; then
+			stop_tunnel
+			reason="tailcat forward exited"
+			return 1
+		fi
+		sleep 0.1
+	done
+	if [[ -z $api_port || -z $client_port ]]; then
+		stop_tunnel
+		reason="tailcat forward did not start listening"
+		return 1
+	fi
+
+	# herdr derives the client socket from HERDR_SOCKET_PATH by turning
+	# herdr.sock into herdr-client.sock in the same directory.
+	socat "UNIX-LISTEN:$api_sock,fork,mode=600" "TCP:127.0.0.1:$api_port" </dev/null 2>>"$log" &
+	pids+=($!)
+	socat "UNIX-LISTEN:$client_sock,fork,mode=600" "TCP:127.0.0.1:$client_port" </dev/null 2>>"$log" &
+	pids+=($!)
+
+	for _ in $(seq 1 50); do
+		[[ -S $api_sock && -S $client_sock ]] && return 0
+		sleep 0.1
+	done
+	stop_tunnel
+	reason="socat bridges did not start"
+	return 1
+}
+
+run_herdr() {
+	env -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION \
+		HERDR_SOCKET_PATH="$api_sock" herdr "$@"
+}
+
+if ! start_tunnel; then
+	fail "$reason"
+fi
+
+# One-shot CLI command: no reconnect logic.
+if (($# > 0)); then
+	set +e
+	run_herdr "$@"
+	status=$?
+	set -e
+	exit "$status"
+fi
+
+# TUI mode via the hidden `herdr client`, which attaches to an existing
+# server's client socket without ever spawning a local server. herdr exits
+# 0 on quit/detach and 1 with "herdr: <error>" on stderr otherwise
+# (src/client/mod.rs); only transport errors are retried.
+retries=0
+backoff=1
+while :; do
+	started=$(date +%s)
+	set +e
+	run_herdr client 2>"$errfile"
+	rc=$?
+	set -e
+	cat "$errfile" >&2
+	note "herdr client exited rc=$rc: $(tr '\n' ' ' <"$errfile")"
+	if ((rc == 0)); then
+		exit 0
+	fi
+	if ! grep -q -E 'lost connection to (server|remote Herdr)|failed to connect to server' "$errfile"; then
+		status=$rc
+		exit "$rc"
+	fi
+
+	# A session that stayed up for a while resets the backoff.
+	if (($(date +%s) - started >= 60)); then
+		retries=0
+		backoff=1
+	fi
+
+	stop_tunnel
+	while :; do
+		retries=$((retries + 1))
+		if ((max_retries > 0 && retries > max_retries)); then
+			status=1
+			fail "giving up after $max_retries reconnect attempts"
+		fi
+		echo "herdr-tc: connection lost, reconnecting in ${backoff}s (attempt $retries, Ctrl-C to stop)..." >&2
+		sleep "$backoff"
+		backoff=$((backoff * 2 > 30 ? 30 : backoff * 2))
+		if start_tunnel; then
+			note "tunnel rebuilt"
+			break
+		fi
+		echo "herdr-tc: $reason" >&2
+	done
+done

@@ -88,6 +88,43 @@ socat UNIX-LISTEN:/tmp/herdr-remote.sock,fork EXEC:'tailcat <token> 6464'
 Clients need tailcat v0.6.0 or newer (the address format gained a disco key
 and pre-shared key in v0.6.0).
 
+### Attaching the herdr TUI (`scripts/herdr-tc`)
+
+`scripts/herdr-tc` attaches your local herdr to the remote server through the
+tunnel, with no SSH involved. It needs `tailcat`, `socat`, and `herdr` on
+`PATH` (macOS or Linux), and the local herdr should match the remote version.
+
+```sh
+scripts/herdr-tc <token>                    # attach the TUI
+scripts/herdr-tc <token> workspace list     # run one herdr CLI command remotely
+HERDR_TC_KEY=mykey scripts/herdr-tc <token> # use a specific client key
+```
+
+How it works:
+
+- One `tailcat forward` process maps tunnel ports 6464/6465 to free local
+  ports. Using a single process matters: a client key must not be used by
+  two tailcat processes at once.
+- Two `socat` bridges expose them as `herdr.sock` / `herdr-client.sock` in a
+  private temp dir. With `HERDR_SOCKET_PATH` pointing at it, herdr's hidden
+  `herdr client` mode attaches to the existing server instead of starting a
+  local one.
+- If the connection drops (`lost connection to server`), the whole tunnel
+  is rebuilt and herdr reattaches, with exponential backoff (1s up to 30s).
+  Rebuilding the tunnel, not just herdr, is required: a tailcat client never
+  recovers after the server restarts. Set `HERDR_TC_MAX_RETRIES` to cap
+  consecutive attempts (default: retry forever).
+- Quitting or detaching herdr tears everything down. `tailcat forward` can
+  block forever on SIGTERM while a tunnel connection waits for the remote
+  end to close, so it is sent SIGKILL after 3 seconds.
+- Per-run logs are kept in `~/Library/Logs/herdr-tc` (macOS) or
+  `$XDG_STATE_HOME/herdr-tc` (Linux); override with `HERDR_TC_LOG_DIR`.
+
+Without `HERDR_TC_KEY`, tailcat uses its saved `client-default` key if one
+exists, else an ephemeral key, which an `allow.list` will reject. Run it from
+a plain terminal, not inside a herdr pane (nested herdr is disabled by
+default).
+
 ## Key & token stability
 
 The token is derived from the server identity: same key, same token. The
@@ -142,6 +179,7 @@ cmd/herdr-tailcatd/main.go           tunnel daemon (`serve`) and subcommand disp
 cmd/herdr-tailcatd/control.go        start (detached, idempotent) / stop / token
 cmd/herdr-tailcatd/platform_*.go     unix socket vs. Windows named pipe, process control
 scripts/build.sh                     go build → bin/herdr-tailcatd[.exe]
+scripts/herdr-tc                     client: attach the herdr TUI over the tunnel, auto-reconnect
 ```
 
 ## Development
